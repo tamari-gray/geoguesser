@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GeoGuesser · Admin</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📍</text></svg>">
+<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="admin">
+
+<header class="admin-bar">
+  <div class="brand-sm">📍 GeoGuesser <span class="badge">Admin</span> <span class="muted small" id="adminName"></span></div>
+  <div class="actions">
+    <a class="btn btn-primary btn-sm" href="/display.html" target="_blank" rel="noopener">🖥️ Open presenter screen</a>
+    <button type="button" class="btn btn-ghost btn-sm" id="logoutBtn">Log out</button>
+  </div>
+</header>
+
+<main class="admin-main">
+  <div class="admin-col">
+    <section class="card">
+      <div class="card-head"><h2>Game</h2><span id="phaseBadge" class="phase-badge"></span></div>
+      <div id="gameStatus" class="game-status"></div>
+      <div id="gameActions" class="actions"></div>
+      <h3>Teams <span id="teamCount" class="muted"></span>
+        <button type="button" class="btn btn-ghost btn-sm push-right" id="clearTeamsBtn">Remove all teams</button>
+      </h3>
+      <ul id="adminTeams" class="admin-teams"></ul>
+      <p class="muted small" id="joinHint"></p>
+    </section>
+
+    <section class="card howto">
+      <h2>How to run it</h2>
+      <ol>
+        <li>Add your photos below and put them in order.</li>
+        <li>Click <b>Open presenter screen</b>, drag that window onto the big monitor and press <b>⛶</b> for fullscreen.</li>
+        <li>Teams scan the QR code (or type the URL) and enter a team name.</li>
+        <li>Run the whole game from the presenter screen: click the button at the top, or press <b>Space</b>, to start and move to the next round.</li>
+      </ol>
+      <p class="muted small">Rounds end after the timer, or early once every team has locked in. A pin dropped but not submitted still counts. The closest team gets 1 point per round.</p>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Settings</h2><span class="muted small" id="settingsSaved" hidden>Saved ✓</span></div>
+      <div class="settings-grid">
+        <label>Round timer (seconds)
+          <input type="number" id="timerInput" min="5" max="600" step="5">
+        </label>
+        <label class="check"><input type="checkbox" id="photoToggle"> Also show the photo on team phones (Map / Photo tabs)</label>
+        <div>
+          <div class="field-label">Where team maps start: <span id="mapStartText" class="muted"></span></div>
+          <div class="actions">
+            <button type="button" class="btn btn-secondary btn-sm" id="useViewBtn">Use the current view of the rounds map</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="worldViewBtn">Whole world</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="admin-col">
+    <section class="card">
+      <div class="card-head"><h2>Rounds</h2><span class="muted" id="roundCount"></span></div>
+      <div id="ephemeralWarn" class="warn-box" hidden>
+        ⚠️ <b>This live site can't keep new photos.</b> Rounds and settings changed here are wiped whenever the server restarts or sleeps.
+        Add rounds on your laptop instead (<code>npm start</code>, then this admin page), then run <code>npm run deploy</code>.
+      </div>
+      <form id="addForm" class="add-grid" autocomplete="off">
+        <div class="add-left">
+          <label class="drop-zone" id="dropZone">
+            <input type="file" id="photoInput" accept="image/*" hidden>
+            <img id="photoPreview" hidden alt="">
+            <span id="dropText">📷 Click or drop a photo here</span>
+          </label>
+          <label>Answer / description <span class="muted small">(shown at the reveal)</span>
+            <input type="text" id="labelInput" maxlength="100" placeholder="e.g. The office kitchen">
+          </label>
+          <label>Latitude, longitude
+            <input type="text" id="coordsInput" placeholder="e.g. 51.50740, -0.12780">
+          </label>
+          <p class="gps-note" id="gpsNote" hidden>📍 Location read from the photo's GPS data. Check it on the map.</p>
+          <p class="muted small">Click the map to set the spot, or paste coordinates. In Google Maps, right-click a spot and click the numbers to copy them.</p>
+          <button type="submit" class="btn btn-primary" id="addBtn">➕ Add round</button>
+          <p id="addError" class="error" hidden></p>
+        </div>
+        <div class="add-right">
+          <div class="map-search">
+            <input type="text" id="searchInput" placeholder="Search a place to jump the map there…">
+            <button type="button" class="btn btn-secondary" id="searchBtn">Go</button>
+          </div>
+          <div id="pickMap" class="pick-map"></div>
+        </div>
+      </form>
+      <ol id="roundList" class="round-list"></ol>
+      <p id="roundsEmpty" class="muted empty">No rounds yet. Add your first photo above.</p>
+    </section>
+  </div>
+</main>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/vendor/leaflet/leaflet.js"></script>
+<script src="/vendor/exifr/full.umd.js"></script>
+<script src="/common.js"></script>
+<script>
+const $ = sel => document.querySelector(sel);
+const esc = GG.escapeHtml;
+const adminName = localStorage.getItem('gg_admin');
+if (!adminName) location.replace('/'); // the server re-checks it on every request
+$('#adminName').textContent = adminName;
+
+$('#logoutBtn').addEventListener('click', () => {
+  localStorage.removeItem('gg_admin');
+  location.href = '/';
+});
+
+async function api(url, { method = 'GET', body } = {}) {
+  const headers = { 'x-admin': adminName };
+  if (body && !(body instanceof FormData)) {
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify(body);
+  }
+  const res = await fetch(url, { method, headers, body });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 403) location.replace('/');
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+// ================= Game control (live over socket) =================
+const socket = io();
+const clock = GG.createClock();
+let state = null;
+
+socket.on('connect', () => socket.emit('join', { name: adminName, role: 'admin' }, res => {
+  if (!res?.ok) location.replace('/');
+}));
+socket.on('state', s => {
+  clock.sync(s.now);
+  state = s;
+  renderGame();
+});
+
+function act(event, payload = {}) {
+  socket.emit(event, payload, res => { if (!res?.ok) alert(res?.error || 'Something went wrong.'); });
+}
+
+const PHASES = { lobby: 'Lobby', round: 'Round in progress', results: 'Showing results', final: 'Game over' };
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+function renderGame() {
+  const s = state;
+  $('#phaseBadge').textContent = PHASES[s.phase];
+  $('#phaseBadge').className = `phase-badge ${s.phase}`;
+  $('#ephemeralWarn').hidden = !s.ephemeralStorage;
+
+  let status = '';
+  if (s.phase === 'lobby') {
+    status = `<b>${plural(s.roundsCount, 'round')}</b> ready · <b>${plural(s.teams.length, 'team')}</b> joined`;
+  } else if (s.phase === 'round') {
+    const done = s.teams.filter(t => t.submitted).length;
+    status = `Round <b>${s.roundNumber}</b> of ${s.totalRounds} · <b id="adminTimer"></b> left · <b>${done}/${s.teams.length}</b> locked in`;
+    if (s.answer) {
+      status += `<div class="answer-peek"><img src="${s.photo}" alt="">
+        <div>Answer: <b>${esc(s.answer.label || '(no description)')}</b><br>
+        <span class="muted small">${s.answer.lat.toFixed(5)}, ${s.answer.lng.toFixed(5)}</span></div></div>`;
+    }
+  } else if (s.phase === 'results') {
+    const r = s.result;
+    const names = r.guesses.filter(g => r.winners.includes(g.teamKey)).map(g => esc(g.name)).join(' & ');
+    status = `Round <b>${s.roundNumber}</b> of ${s.totalRounds} finished · `
+      + (names ? `🏆 <b>${names}</b> (${GG.formatDistance(r.guesses[0].distance)})` : 'nobody guessed');
+  } else if (s.phase === 'final') {
+    status = s.teams.length ? `🏆 <b>${esc(s.teams[0].name)}</b> wins with ${plural(s.teams[0].score, 'point')}` : 'Game over';
+  }
+  $('#gameStatus').innerHTML = status;
+
+  const btns = [];
+  if (s.phase === 'lobby') btns.push(`<button type="button" class="btn btn-primary btn-lg" data-a="start" ${s.roundsCount ? '' : 'disabled'}>▶ Start game</button>`);
+  if (s.phase === 'round') btns.push('<button type="button" class="btn btn-primary" data-a="end">⏭ End round now</button>', '<button type="button" class="btn btn-secondary" data-a="time">+15 s</button>');
+  if (s.phase === 'results') {
+    btns.push(s.roundNumber < s.totalRounds
+      ? `<button type="button" class="btn btn-primary btn-lg" data-a="next">▶ Next round (${s.roundNumber + 1}/${s.totalRounds})</button>`
+      : '<button type="button" class="btn btn-primary btn-lg" data-a="next">🏆 Show final standings</button>');
+  }
+  if (s.phase === 'final') btns.push('<button type="button" class="btn btn-primary" data-a="start">↻ Play again (same teams)</button>');
+  if (s.phase !== 'lobby') btns.push('<button type="button" class="btn btn-danger btn-sm" data-a="reset">Back to lobby</button>');
+  $('#gameActions').innerHTML = btns.join('');
+
+  $('#teamCount').textContent = `(${s.teams.length})`;
+  $('#clearTeamsBtn').hidden = !s.teams.length;
+  $('#adminTeams').innerHTML = s.teams.length
+    ? s.teams.map(t => `<li>
+        <span class="dot" style="--c:${t.color}"></span>
+        <span class="name">${esc(t.name)}</span>
+        <span class="conn${t.connected ? ' on' : ''}" title="${t.connected ? 'Connected' : 'Offline'}"></span>
+        ${s.phase === 'round' ? `<span class="sub">${t.submitted ? '✓ locked in' : t.hasPin ? '📍 pinned' : '…'}</span>` : ''}
+        <span class="score">${plural(t.score, 'pt')}</span>
+        <button type="button" class="icon-btn danger" data-remove="${esc(t.key)}" title="Remove team">✕</button>
+      </li>`).join('')
+    : '<li class="muted">No teams yet. They join from the home page.</li>';
+  tick();
+}
+
+$('#gameActions').addEventListener('click', e => {
+  const a = e.target.closest('[data-a]')?.dataset.a;
+  if (a === 'start') {
+    if (!state.teams.length && !confirm('No teams have joined yet. Start anyway?')) return;
+    act('admin:start');
+  }
+  if (a === 'end') act('admin:endRound');
+  if (a === 'time') act('admin:addTime');
+  if (a === 'next') act('admin:next');
+  if (a === 'reset' && confirm('Stop the game and go back to the lobby? Scores are cleared, teams stay.')) act('admin:reset', { keepTeams: true });
+});
+
+$('#adminTeams').addEventListener('click', e => {
+  const key = e.target.closest('[data-remove]')?.dataset.remove;
+  if (key && confirm('Remove this team?')) act('admin:removeTeam', { key });
+});
+
+$('#clearTeamsBtn').addEventListener('click', () => {
+  if (confirm('Remove ALL teams and go back to the lobby? (Handy for clearing out test teams.)')) act('admin:reset', { keepTeams: false });
+});
+
+function tick() {
+  const el = $('#adminTimer');
+  if (el && state?.phase === 'round') el.textContent = `${Math.ceil(GG.msLeft(state, clock) / 1000)}s`;
+}
+setInterval(tick, 250);
+
+GG.joinUrl().then(url => {
+  $('#joinHint').innerHTML = `Teams join at <b>${esc(url)}</b> (the QR code is on the presenter screen).`;
+});
+
+// ================= Rounds =================
+let rounds = [];
+let settings = null;
+let pickedFile = null, previewUrl = null, pickMarker = null;
+
+const pickMap = GG.createMap('pickMap');
+const roundMarkers = L.layerGroup().addTo(pickMap);
+pickMap.setView([20, 0], 2);
+pickMap.on('click', e => {
+  const ll = e.latlng.wrap();
+  setPick(ll.lat, ll.lng, false);
+});
+
+function setPick(lat, lng, pan) {
+  $('#coordsInput').value = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+  if (pickMarker) {
+    pickMarker.setLatLng([lat, lng]);
+  } else {
+    pickMarker = L.marker([lat, lng], { icon: GG.answerIcon(), draggable: true, zIndexOffset: 1000 }).addTo(pickMap);
+    pickMarker.on('dragend', () => {
+      const ll = pickMarker.getLatLng().wrap();
+      setPick(ll.lat, ll.lng, false);
+    });
+  }
+  if (pan) pickMap.setView([lat, lng], Math.max(pickMap.getZoom(), 16));
+}
+
+function showAddError(msg) {
+  $('#addError').textContent = msg || '';
+  $('#addError').hidden = !msg;
+}
+
+$('#coordsInput').addEventListener('change', () => {
+  const c = GG.parseCoords($('#coordsInput').value);
+  if (c) { showAddError(''); setPick(c.lat, c.lng, true); }
+  else if ($('#coordsInput').value.trim()) showAddError('Coordinates should look like "51.5074, -0.1278".');
+});
+
+async function searchPlace() {
+  const q = $('#searchInput').value.trim();
+  if (!q) return;
+  const c = /^\s*-?\d/.test(q) && GG.parseCoords(q);
+  if (c) return pickMap.setView([c.lat, c.lng], 17);
+  try {
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`);
+    const [hit] = await res.json();
+    if (!hit) return showAddError(`Couldn't find "${q}".`);
+    showAddError('');
+    pickMap.setView([Number(hit.lat), Number(hit.lon)], 17);
+  } catch {
+    showAddError('Search failed. Are you online?');
+  }
+}
+$('#searchBtn').addEventListener('click', searchPlace);
+$('#searchInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); searchPlace(); }
+});
+
+// ----- photo picking -----
+const dropZone = $('#dropZone');
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('over');
+  handleFile(e.dataTransfer.files[0]);
+});
+$('#photoInput').addEventListener('change', e => handleFile(e.target.files[0]));
+
+async function handleFile(file) {
+  showAddError('');
+  if (!file) return;
+  if (/\.(heic|heif)$/i.test(file.name) || /heic|heif/i.test(file.type)) {
+    return showAddError("HEIC photos won't display in most browsers. Save it as a JPG first (on iPhone: Settings > Camera > Formats > Most Compatible).");
+  }
+  if (!file.type.startsWith('image/')) return showAddError("That doesn't look like an image.");
+  pickedFile = file;
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  previewUrl = URL.createObjectURL(file);
+  $('#photoPreview').src = previewUrl;
+  $('#photoPreview').hidden = false;
+  $('#dropText').hidden = true;
+  $('#gpsNote').hidden = true;
+  try {
+    const gps = await exifr.gps(file);
+    if (gps && Number.isFinite(gps.latitude) && Number.isFinite(gps.longitude)) {
+      setPick(gps.latitude, gps.longitude, true);
+      $('#gpsNote').hidden = false;
+    }
+  } catch { /* no GPS data, that's fine */ }
+}
+
+// Phone photos are often 5-10 MB; shrink to a ~2000px JPEG so they load fast on mobile data
+async function shrinkImage(file, maxSide = 2048) {
+  try {
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
+    if (scale === 1 && file.size < 1.5e6) return file;
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bmp.width * scale);
+    canvas.height = Math.round(bmp.height * scale);
+    canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+    return blob ? new File([blob], file.name.replace(/\.\w+$/, '') + '.jpg', { type: 'image/jpeg' }) : file;
+  } catch {
+    return file;
+  }
+}
+
+function resetAddForm() {
+  pickedFile = null;
+  $('#photoInput').value = '';
+  $('#photoPreview').hidden = true;
+  $('#dropText').hidden = false;
+  $('#labelInput').value = '';
+  $('#coordsInput').value = '';
+  $('#gpsNote').hidden = true;
+  if (pickMarker) pickMarker.remove();
+  pickMarker = null;
+}
+
+$('#addForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  showAddError('');
+  const coords = GG.parseCoords($('#coordsInput').value);
+  if (!pickedFile) return showAddError('Choose a photo first.');
+  if (!coords) return showAddError('Set the location: click the map or paste coordinates.');
+  const btn = $('#addBtn');
+  btn.disabled = true;
+  btn.textContent = 'Uploading…';
+  try {
+    const fd = new FormData();
+    fd.append('photo', await shrinkImage(pickedFile));
+    fd.append('lat', coords.lat);
+    fd.append('lng', coords.lng);
+    fd.append('label', $('#labelInput').value.trim());
+    await api('/api/rounds', { method: 'POST', body: fd });
+    resetAddForm();
+    await loadRounds();
+  } catch (err) {
+    showAddError(err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '➕ Add round';
+  }
+});
+
+// ----- round list -----
+async function loadRounds() {
+  rounds = await api('/api/rounds');
+  renderRounds();
+}
+
+function renderRounds() {
+  $('#roundCount').textContent = rounds.length ? plural(rounds.length, 'round') : '';
+  $('#roundsEmpty').hidden = rounds.length > 0;
+  $('#roundList').innerHTML = rounds.map((r, i) => `
+    <li class="round-item" data-id="${r.id}">
+      <span class="handle" title="Drag to reorder">⠿</span>
+      <span class="round-num">${i + 1}</span>
+      <img src="/uploads/${esc(r.file)}" class="thumb" loading="lazy" alt="">
+      <div class="round-fields">
+        <input class="r-label" value="${esc(r.label)}" placeholder="Answer / description" maxlength="100">
+        <input class="r-coords" value="${r.lat.toFixed(6)}, ${r.lng.toFixed(6)}" title="Latitude, longitude">
+      </div>
+      <div class="round-btns">
+        <button type="button" class="icon-btn" data-act="up" ${i === 0 ? 'disabled' : ''} title="Move up">▲</button>
+        <button type="button" class="icon-btn" data-act="down" ${i === rounds.length - 1 ? 'disabled' : ''} title="Move down">▼</button>
+        <button type="button" class="icon-btn" data-act="locate" title="Show on the map above">📍</button>
+        <a class="icon-btn" href="https://www.google.com/maps?q=${r.lat},${r.lng}" target="_blank" rel="noopener" title="Check in Google Maps">G</a>
+        <button type="button" class="icon-btn danger" data-act="del" title="Delete round">🗑</button>
+      </div>
+    </li>`).join('');
+
+  roundMarkers.clearLayers();
+  rounds.forEach((r, i) => {
+    L.marker([r.lat, r.lng], { icon: GG.pinIcon('#64748b', String(i + 1)) })
+      .bindTooltip(esc(r.label || `Round ${i + 1}`), { direction: 'top', className: 'gg-tip' })
+      .addTo(roundMarkers);
+  });
+}
+
+async function saveOrder(ids) {
+  if (ids.join() === rounds.map(r => r.id).join()) return;
+  try {
+    rounds = await api('/api/rounds/order', { method: 'PUT', body: { ids } });
+  } catch (err) {
+    alert(err.message);
+  }
+  renderRounds();
+}
+
+const list = $('#roundList');
+
+list.addEventListener('click', async e => {
+  const btn = e.target.closest('[data-act]');
+  if (!btn) return;
+  const id = btn.closest('.round-item').dataset.id;
+  const i = rounds.findIndex(r => r.id === id);
+  const ids = rounds.map(r => r.id);
+  const act = btn.dataset.act;
+  if (act === 'up' || act === 'down') {
+    const j = act === 'up' ? i - 1 : i + 1;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    saveOrder(ids);
+  } else if (act === 'locate') {
+    pickMap.setView([rounds[i].lat, rounds[i].lng], 17);
+    $('#pickMap').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  } else if (act === 'del') {
+    if (!confirm(`Delete round ${i + 1}?`)) return;
+    try {
+      await api(`/api/rounds/${id}`, { method: 'DELETE' });
+      await loadRounds();
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+});
+
+list.addEventListener('change', async e => {
+  const li = e.target.closest('.round-item');
+  if (!li) return;
+  const id = li.dataset.id;
+  try {
+    if (e.target.classList.contains('r-label')) {
+      await api(`/api/rounds/${id}`, { method: 'PUT', body: { label: e.target.value } });
+    } else if (e.target.classList.contains('r-coords')) {
+      const c = GG.parseCoords(e.target.value);
+      if (!c) throw new Error('Coordinates should look like "51.5074, -0.1278".');
+      await api(`/api/rounds/${id}`, { method: 'PUT', body: c });
+    }
+    await loadRounds();
+    const saved = list.querySelector(`[data-id="${id}"]`);
+    saved?.classList.add('saved');
+    setTimeout(() => saved?.classList.remove('saved'), 900);
+  } catch (err) {
+    alert(err.message);
+    loadRounds();
+  }
+});
+
+// drag to reorder (only from the handle, so the text inputs stay usable)
+list.addEventListener('pointerdown', e => {
+  const li = e.target.closest('.round-item');
+  if (li) li.draggable = !!e.target.closest('.handle');
+});
+list.addEventListener('dragstart', e => {
+  const li = e.target.closest('.round-item');
+  if (!li) return;
+  li.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', li.dataset.id);
+});
+list.addEventListener('dragover', e => {
+  const dragging = list.querySelector('.dragging');
+  const li = e.target.closest('.round-item');
+  if (!dragging) return;
+  e.preventDefault();
+  if (!li || li === dragging) return;
+  const rect = li.getBoundingClientRect();
+  list.insertBefore(dragging, e.clientY > rect.top + rect.height / 2 ? li.nextSibling : li);
+});
+list.addEventListener('dragend', () => {
+  const dragging = list.querySelector('.dragging');
+  if (!dragging) return;
+  dragging.classList.remove('dragging');
+  dragging.draggable = false;
+  saveOrder([...list.children].map(li => li.dataset.id));
+});
+
+// ================= Settings =================
+function renderSettings() {
+  $('#timerInput').value = settings.timerSeconds;
+  $('#photoToggle').checked = settings.showPhotoOnDevices;
+  const m = settings.mapStart;
+  $('#mapStartText').textContent = m.zoom <= 2 ? 'whole world' : `${m.lat.toFixed(3)}, ${m.lng.toFixed(3)} (zoom ${m.zoom})`;
+}
+
+let savedTimer;
+async function saveSettings(patch) {
+  try {
+    settings = await api('/api/settings', { method: 'PUT', body: patch });
+    $('#settingsSaved').hidden = false;
+    clearTimeout(savedTimer);
+    savedTimer = setTimeout(() => { $('#settingsSaved').hidden = true; }, 1500);
+  } catch (err) {
+    alert(err.message);
+  }
+  renderSettings();
+}
+
+$('#timerInput').addEventListener('change', e => saveSettings({ timerSeconds: Number(e.target.value) }));
+$('#photoToggle').addEventListener('change', e => saveSettings({ showPhotoOnDevices: e.target.checked }));
+$('#useViewBtn').addEventListener('click', () => {
+  const c = pickMap.getCenter().wrap();
+  saveSettings({ mapStart: { lat: c.lat, lng: c.lng, zoom: pickMap.getZoom() } });
+});
+$('#worldViewBtn').addEventListener('click', () => saveSettings({ mapStart: { lat: 20, lng: 0, zoom: 2 } }));
+
+// ================= Init =================
+(async () => {
+  [settings, rounds] = await Promise.all([api('/api/settings'), api('/api/rounds')]);
+  renderSettings();
+  renderRounds();
+  if (rounds.length) {
+    pickMap.fitBounds(L.latLngBounds(rounds.map(r => [r.lat, r.lng])), { padding: [40, 40], maxZoom: 16 });
+  } else {
+    pickMap.setView([settings.mapStart.lat, settings.mapStart.lng], settings.mapStart.zoom);
+  }
+})();
+</script>
+</body>
+</html>

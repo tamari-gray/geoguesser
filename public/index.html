@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1120">
+<title>GeoGuesser</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📍</text></svg>">
+<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="player">
+
+<div id="offline" class="offline-banner" hidden>Reconnecting…</div>
+<div id="toast" class="toast" hidden></div>
+
+<!-- Home -->
+<section id="home" class="screen center-screen">
+  <div class="brand">
+    <div class="brand-pin">📍</div>
+    <h1>GeoGuesser</h1>
+    <p class="muted">Where in the world was this photo taken?</p>
+  </div>
+  <form id="joinForm" class="join-card" autocomplete="off">
+    <input id="nameInput" type="text" placeholder="Enter username" maxlength="24" autocapitalize="words" enterkeyhint="go" spellcheck="false">
+    <button type="submit" class="btn btn-primary btn-lg">Play Game</button>
+    <p id="joinError" class="error" hidden></p>
+  </form>
+</section>
+
+<!-- Lobby -->
+<section id="lobby" class="screen center-screen" hidden>
+  <div class="card lobby-card">
+    <p class="muted">You're playing as</p>
+    <h2 id="lobbyTeam" class="team-title"></h2>
+    <div class="waiting"><span class="spinner"></span>Waiting for the host to start the game…</div>
+    <p class="muted small" id="lobbyInfo"></p>
+    <h3>Teams in the game</h3>
+    <ul id="lobbyTeams" class="chips centered"></ul>
+    <button id="leaveBtn" type="button" class="btn btn-ghost btn-sm">Not you? Change name</button>
+  </div>
+</section>
+
+<!-- Round + results -->
+<section id="game" class="screen game-screen" hidden>
+  <header class="game-bar">
+    <div class="round-label" id="roundLabel"></div>
+    <div class="team-tag" id="teamTag"></div>
+    <div class="timer" id="timer"></div>
+  </header>
+  <div class="view-tabs" id="viewTabs">
+    <button type="button" data-view="map" class="active">🗺️ Map</button>
+    <button type="button" data-view="photo">📷 Photo</button>
+  </div>
+  <div class="game-body">
+    <div id="map" class="map"></div>
+    <div id="photoView" class="photo-view" hidden>
+      <img id="photoImg" alt="Round photo">
+      <a id="photoFull" class="photo-full" target="_blank" rel="noopener">Open full size ↗</a>
+    </div>
+  </div>
+  <footer class="game-foot" id="roundFoot">
+    <button id="submitBtn" type="button" class="btn btn-primary btn-lg btn-block" disabled></button>
+  </footer>
+  <footer class="game-foot results-foot" id="resultsFoot" hidden>
+    <div id="resultSummary"></div>
+    <p class="muted small waiting-next"><span class="spinner"></span>Waiting for the host to start the next round…</p>
+  </footer>
+</section>
+
+<!-- Final -->
+<section id="final" class="screen center-screen" hidden>
+  <div class="card final-card">
+    <div class="trophy">🏆</div>
+    <h2>Final standings</h2>
+    <ol id="finalList" class="leaderboard"></ol>
+  </div>
+</section>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/vendor/leaflet/leaflet.js"></script>
+<script src="/common.js"></script>
+<script>
+const $ = sel => document.querySelector(sel);
+const esc = GG.escapeHtml;
+const socket = io();
+const clock = GG.createClock();
+
+let myName = localStorage.getItem('gg_name') || '';
+let state = null;
+let map = null, resultLayer = null, myMarker = null;
+let roundKey = null, submitting = false, lastTimeUp = null;
+
+function show(id) {
+  document.querySelectorAll('.screen').forEach(s => { s.hidden = s.id !== id; });
+  if (id === 'game' && map) map.invalidateSize();
+}
+
+function showJoinError(msg) {
+  $('#joinError').textContent = msg || '';
+  $('#joinError').hidden = !msg;
+}
+
+let toastTimer;
+function toast(msg) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 3000);
+}
+
+function goHome(message) {
+  myName = '';
+  state = null;
+  localStorage.removeItem('gg_name');
+  $('#nameInput').value = '';
+  show('home');
+  showJoinError(message);
+}
+
+// ---------- joining ----------
+$('#nameInput').value = myName;
+
+$('#joinForm').addEventListener('submit', e => {
+  e.preventDefault();
+  showJoinError('');
+  const name = $('#nameInput').value.trim();
+  if (!name) return showJoinError('Please enter a username.');
+  join(name);
+});
+
+// the server decides whether a name is the admin, so the admin name never ships to browsers
+function join(name) {
+  const btn = $('#joinForm button');
+  btn.disabled = true;
+  socket.emit('join', { name, role: 'player' }, res => {
+    btn.disabled = false;
+    if (!res?.ok) return goHome(res?.error || 'Could not join.');
+    if (res.role === 'admin') {
+      localStorage.setItem('gg_admin', name);
+      location.href = '/admin.html';
+      return;
+    }
+    myName = res.team.name;
+    localStorage.setItem('gg_name', myName);
+  });
+}
+
+$('#leaveBtn').addEventListener('click', () => {
+  socket.emit('leave');
+  goHome('');
+});
+
+socket.on('connect', () => {
+  $('#offline').hidden = true;
+  if (myName) join(myName);
+});
+socket.on('disconnect', () => { $('#offline').hidden = false; });
+socket.on('kicked', () => goHome('The host removed your team. Enter a name to join again.'));
+socket.on('state', s => {
+  clock.sync(s.now);
+  state = s;
+  render();
+});
+
+// ---------- rendering ----------
+function render() {
+  if (!state || !myName || !state.myTeam) return;
+  if (state.phase === 'lobby') renderLobby();
+  else if (state.phase === 'final') renderFinal();
+  else renderGame();
+}
+
+const teamLabel = t => `<span class="dot" style="--c:${t.color}"></span>${esc(t.name)}`;
+
+function renderLobby() {
+  roundKey = null;
+  $('#lobbyTeam').innerHTML = teamLabel(state.myTeam);
+  $('#lobbyInfo').textContent = state.totalRounds
+    ? `${state.totalRounds} rounds · ${state.timerSeconds} seconds each`
+    : '';
+  $('#lobbyTeams').innerHTML = state.teams
+    .map(t => GG.teamChip(t, t.key === state.myTeam.key ? ' <span class="muted">(you)</span>' : ''))
+    .join('');
+  show('lobby');
+}
+
+function ensureMap() {
+  if (map) return;
+  map = GG.createMap('map');
+  resultLayer = L.layerGroup().addTo(map);
+  map.on('click', e => placePin(e.latlng.wrap()));
+}
+
+function setView(view) {
+  $('#photoView').hidden = view !== 'photo';
+  document.querySelectorAll('#viewTabs button').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+}
+$('#viewTabs').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (b) setView(b.dataset.view);
+});
+
+function renderGame() {
+  show('game');
+  ensureMap();
+  const key = `${state.phase}:${state.roundNumber}`;
+  const isNew = key !== roundKey;
+  roundKey = key;
+
+  const inRound = state.phase === 'round';
+  $('#roundLabel').textContent = inRound
+    ? `Round ${state.roundNumber} / ${state.totalRounds}`
+    : `Round ${state.roundNumber} results`;
+  $('#teamTag').innerHTML = teamLabel(state.myTeam);
+  $('#timer').hidden = !inRound;
+  $('#roundFoot').hidden = !inRound;
+  $('#resultsFoot').hidden = inRound;
+
+  const hasPhoto = !!state.photo;
+  $('#viewTabs').hidden = !hasPhoto;
+  if (hasPhoto && $('#photoImg').getAttribute('src') !== state.photo) {
+    $('#photoImg').src = state.photo;
+    $('#photoFull').href = state.photo;
+  }
+
+  if (inRound) {
+    if (isNew) {
+      submitting = false;
+      lastTimeUp = null;
+      resultLayer.clearLayers();
+      removeMyMarker();
+      setView('map');
+      map.invalidateSize();
+      map.setView([state.mapStart.lat, state.mapStart.lng], state.mapStart.zoom);
+    }
+    if (state.myGuess && !myMarker) setMyMarker([state.myGuess.lat, state.myGuess.lng]); // after a refresh
+    updateSubmit();
+    tick();
+  } else {
+    if (isNew) {
+      removeMyMarker();
+      setView('map');
+      GG.drawResults(map, resultLayer, state.result, { animate: true });
+    }
+    renderResultSummary();
+  }
+}
+
+// ---------- guessing ----------
+function removeMyMarker() {
+  if (myMarker) myMarker.remove();
+  myMarker = null;
+}
+
+function canGuess() {
+  return state?.phase === 'round' && !state.myGuess?.submitted && !submitting && GG.msLeft(state, clock) > 0;
+}
+
+function setMyMarker(latlng) {
+  if (myMarker) return myMarker.setLatLng(latlng);
+  myMarker = L.marker(latlng, {
+    icon: GG.pinIcon(state.myTeam.color, GG.initials(state.myTeam.name)),
+    draggable: true,
+    zIndexOffset: 1000,
+  }).addTo(map);
+  myMarker.on('dragend', () => {
+    myMarker.setLatLng(myMarker.getLatLng().wrap());
+    sendDraft();
+  });
+  updateSubmit();
+}
+
+function placePin(latlng) {
+  if (!canGuess()) return;
+  setMyMarker(latlng);
+  sendDraft();
+}
+
+// the server keeps our latest pin so it still counts if time runs out before submitting
+function sendDraft() {
+  const ll = myMarker.getLatLng();
+  socket.emit('guess', { lat: ll.lat, lng: ll.lng, final: false });
+}
+
+$('#submitBtn').addEventListener('click', () => {
+  if (!myMarker || !canGuess()) return;
+  submitting = true;
+  updateSubmit();
+  const ll = myMarker.getLatLng();
+  socket.emit('guess', { lat: ll.lat, lng: ll.lng, final: true }, res => {
+    submitting = false;
+    if (!res?.ok) toast(res?.error || 'Could not submit your guess.');
+    updateSubmit();
+  });
+});
+
+function updateSubmit() {
+  if (!state || state.phase !== 'round') return;
+  const btn = $('#submitBtn');
+  const submitted = !!state.myGuess?.submitted;
+  const timeUp = GG.msLeft(state, clock) <= 0;
+  if (myMarker?.dragging) (submitted || timeUp) ? myMarker.dragging.disable() : myMarker.dragging.enable();
+  btn.classList.toggle('done', submitted);
+  if (submitted) {
+    btn.disabled = true;
+    btn.textContent = '✅ Locked in! Waiting for other teams…';
+  } else if (timeUp) {
+    btn.disabled = true;
+    btn.textContent = myMarker ? "⏰ Time's up! Your pin was used" : "⏰ Time's up!";
+  } else if (submitting) {
+    btn.disabled = true;
+    btn.textContent = 'Submitting…';
+  } else if (!myMarker) {
+    btn.disabled = true;
+    btn.textContent = '📍 Tap the map to drop a pin';
+  } else {
+    btn.disabled = false;
+    btn.textContent = 'Submit guess';
+  }
+}
+
+function tick() {
+  if (!state || state.phase !== 'round') return;
+  const ms = GG.msLeft(state, clock);
+  const secs = Math.ceil(ms / 1000);
+  const el = $('#timer');
+  el.textContent = `⏱ ${secs}`;
+  el.classList.toggle('urgent', secs <= 10);
+  const timeUp = ms <= 0;
+  if (timeUp !== lastTimeUp) {
+    lastTimeUp = timeUp;
+    updateSubmit();
+  }
+}
+setInterval(tick, 200);
+
+// ---------- results + final ----------
+function renderResultSummary() {
+  const r = state.result;
+  const me = state.myTeam.key;
+  const mine = r.guesses.find(g => g.teamKey === me);
+  const won = r.winners.includes(me);
+  const winnerNames = r.guesses.filter(g => r.winners.includes(g.teamKey)).map(g => esc(g.name));
+
+  let headline;
+  if (won) headline = '<div class="result-headline win">🏆 Your team won this round! <span class="plus">+1</span></div>';
+  else if (mine) headline = `<div class="result-headline">You were <b>${GG.formatDistance(mine.distance)}</b> away</div>`;
+  else headline = '<div class="result-headline">No guess this round 😬</div>';
+
+  const details = [];
+  if (won && mine) details.push(`You were <b>${GG.formatDistance(mine.distance)}</b> away`);
+  if (!won && winnerNames.length) details.push(`Round won by <b>${winnerNames.join(' & ')}</b> (${GG.formatDistance(r.guesses[0].distance)})`);
+  if (r.answer.label) details.push(`📍 ${esc(r.answer.label)}`);
+
+  const scores = state.teams
+    .map(t => `<li class="chip${t.key === me ? ' me' : ''}"><span class="dot" style="--c:${t.color}"></span>${esc(t.name)} <b>${t.score}</b></li>`)
+    .join('');
+
+  $('#resultSummary').innerHTML = `${headline}
+    ${details.map(d => `<div class="result-detail">${d}</div>`).join('')}
+    <ul class="chips scores">${scores}</ul>`;
+}
+
+function renderFinal() {
+  roundKey = null;
+  const me = state.myTeam.key;
+  $('#finalList').innerHTML = state.teams.map((t, i) => `
+    <li class="${t.key === me ? 'me' : ''}">
+      <span class="rank">${GG.medal(i)}</span>
+      <span class="dot" style="--c:${t.color}"></span>
+      <span class="name">${esc(t.name)}</span>
+      <span class="pts">${t.score} pt${t.score === 1 ? '' : 's'}</span>
+    </li>`).join('');
+  show('final');
+}
+</script>
+</body>
+</html>

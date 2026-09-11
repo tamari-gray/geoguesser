@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: geoguesser
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/info
+    envVars:
+      - key: NODE_VERSION
+        value: "22"

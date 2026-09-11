@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GeoGuesser · Presenter</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📍</text></svg>">
+<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="display">
+
+<div id="offline" class="offline-banner" hidden>Reconnecting…</div>
+
+<!-- Lobby -->
+<section id="dLobby" class="screen d-lobby">
+  <div class="d-lobby-main">
+    <div class="brand">
+      <div class="brand-pin">📍</div>
+      <h1>GeoGuesser</h1>
+    </div>
+    <p class="d-sub">One phone per team. Join at</p>
+    <div class="join-url" id="joinUrl"></div>
+    <h3 class="d-teams-title">Teams <span id="dTeamCount" class="muted"></span></h3>
+    <ul id="dLobbyTeams" class="chips big"></ul>
+    <p id="dLobbyInfo" class="muted d-info"></p>
+  </div>
+  <div class="qr-card"><img id="qrImg" alt="QR code to join"><div>Scan to join</div></div>
+</section>
+
+<!-- Round -->
+<section id="dRound" class="screen d-round" hidden>
+  <img id="dPhoto" class="d-photo" alt="">
+  <div class="d-top">
+    <div class="d-round-label" id="dRoundLabel"></div>
+    <div class="ring" id="ring">
+      <svg viewBox="0 0 100 100"><circle class="ring-bg" cx="50" cy="50" r="45"/><circle class="ring-fg" id="ringFg" cx="50" cy="50" r="45"/></svg>
+      <span id="dTimer"></span>
+    </div>
+  </div>
+  <div class="d-bottom"><ul id="dRoundTeams" class="chips big"></ul></div>
+</section>
+
+<!-- Results -->
+<section id="dResults" class="screen d-results" hidden>
+  <div id="dMap" class="d-map"></div>
+  <aside class="d-panel" id="dPanel"></aside>
+</section>
+
+<!-- Final -->
+<section id="dFinal" class="screen d-final" hidden>
+  <div id="confetti" class="confetti"></div>
+  <div class="trophy">🏆</div>
+  <h1 id="dWinner"></h1>
+  <p id="dWinnerSub" class="muted d-sub"></p>
+  <ol id="dFinalList" class="leaderboard big"></ol>
+</section>
+
+<!-- Host controls: only shown when this browser is logged in as admin -->
+<div id="hostBar" class="host-bar" hidden>
+  <button type="button" id="hostPrimary" class="btn btn-primary"></button>
+  <button type="button" id="hostTime" class="btn btn-secondary" hidden>+15 s</button>
+  <span id="hostHint" class="muted small"></span>
+</div>
+<button type="button" id="fsBtn" class="fs-btn" title="Fullscreen">⛶</button>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/vendor/leaflet/leaflet.js"></script>
+<script src="/common.js"></script>
+<script>
+const $ = sel => document.querySelector(sel);
+const esc = GG.escapeHtml;
+const socket = io();
+const clock = GG.createClock();
+const adminName = localStorage.getItem('gg_admin');
+const RING = 2 * Math.PI * 45;
+
+let state = null, isHost = false;
+let map = null, layer = null, shownResult = null, confettiDone = false;
+
+socket.on('connect', () => {
+  $('#offline').hidden = true;
+  if (!adminName) return socket.emit('join', { role: 'display' });
+  socket.emit('join', { name: adminName, role: 'admin' }, res => {
+    isHost = !!res?.ok;
+    if (!isHost) socket.emit('join', { role: 'display' });
+    if (state) updateHostBar();
+  });
+});
+socket.on('disconnect', () => { $('#offline').hidden = false; });
+socket.on('state', s => {
+  clock.sync(s.now);
+  state = s;
+  render();
+});
+
+let shownJoinUrl = null;
+async function refreshJoinUrl() {
+  const url = await GG.joinUrl();
+  if (url === shownJoinUrl) return;
+  shownJoinUrl = url;
+  $('#joinUrl').textContent = url.replace(/^https?:\/\//, '');
+  $('#qrImg').src = '/api/qr?text=' + encodeURIComponent(url);
+}
+refreshJoinUrl();
+setInterval(refreshJoinUrl, 10000); // picks up the tunnel link if it came up after this page loaded
+
+function show(id) {
+  document.querySelectorAll('.screen').forEach(s => { s.hidden = s.id !== id; });
+}
+
+function render() {
+  if (state.phase !== 'results') shownResult = null;
+  if (state.phase !== 'final') confettiDone = false;
+  if (state.phase === 'lobby') renderLobby();
+  else if (state.phase === 'round') renderRound();
+  else if (state.phase === 'results') renderResults();
+  else renderFinal();
+  updateHostBar();
+}
+
+// ---------- lobby ----------
+function renderLobby() {
+  show('dLobby');
+  $('#dTeamCount').textContent = state.teams.length ? `(${state.teams.length})` : '';
+  $('#dLobbyTeams').innerHTML = state.teams.map(t => GG.teamChip(t)).join('');
+  $('#dLobbyInfo').textContent = state.teams.length
+    ? `${state.totalRounds} rounds · ${state.timerSeconds} seconds each · the closest team wins each round`
+    : 'Waiting for teams to join…';
+}
+
+// ---------- round ----------
+function renderRound() {
+  show('dRound');
+  if (state.photo && $('#dPhoto').getAttribute('src') !== state.photo) $('#dPhoto').src = state.photo;
+  $('#dRoundLabel').innerHTML = `Round <b>${state.roundNumber}</b> / ${state.totalRounds}`;
+  $('#dRoundTeams').innerHTML = state.teams.map(t => {
+    const cls = t.submitted ? 'submitted' : t.hasPin ? 'pinned' : 'waiting';
+    const icon = t.submitted ? '✓' : t.hasPin ? '📍' : '…';
+    return `<li class="chip ${cls}"><span class="dot" style="--c:${t.color}"></span>${esc(t.name)} <span class="status">${icon}</span></li>`;
+  }).join('');
+  tick();
+}
+
+function tick() {
+  if (state?.phase !== 'round') return;
+  const ms = GG.msLeft(state, clock);
+  const secs = Math.ceil(ms / 1000);
+  $('#dTimer').textContent = secs;
+  $('#ringFg').style.strokeDashoffset = RING * (1 - Math.min(1, ms / (state.timerSeconds * 1000)));
+  $('#ring').classList.toggle('urgent', secs <= 10);
+}
+setInterval(tick, 200);
+
+// ---------- results ----------
+function renderResults() {
+  show('dResults');
+  if (!map) {
+    map = GG.createMap('dMap', { zoomControl: false });
+    layer = L.layerGroup().addTo(map);
+  }
+  if (shownResult !== state.roundNumber) {
+    shownResult = state.roundNumber;
+    const revealMs = GG.drawResults(map, layer, state.result, { animate: true, permanentLabels: true });
+    renderPanel(revealMs);
+  } else {
+    renderScores(0);
+  }
+}
+
+function renderPanel(revealMs) {
+  const r = state.result;
+  const start = revealMs / 1000 + 0.3;
+  const guessed = new Set(r.guesses.map(g => g.teamKey));
+  const missing = state.teams.filter(t => !guessed.has(t.key));
+  const rows = r.guesses.map((g, i) => {
+    const won = r.winners.includes(g.teamKey);
+    return `<li class="${won ? 'win' : ''}" style="animation-delay:${start + i * 0.15}s">
+      <span class="rank">${GG.medal(i)}</span>
+      <span class="dot" style="--c:${g.color}"></span>
+      <span class="name">${esc(g.name)}</span>
+      <span class="dist">${GG.formatDistance(g.distance)}</span>
+      ${won ? '<span class="plus">+1</span>' : ''}
+    </li>`;
+  }).concat(missing.map((t, i) => `<li class="nog" style="animation-delay:${start + (r.guesses.length + i) * 0.15}s">
+      <span class="rank">–</span><span class="dot" style="--c:${t.color}"></span>
+      <span class="name">${esc(t.name)}</span><span class="dist">no guess</span>
+    </li>`));
+
+  $('#dPanel').innerHTML = `
+    <div class="eyebrow">Round ${state.roundNumber} of ${state.totalRounds}</div>
+    <h2 class="d-answer">🏁 ${esc(r.answer.label || 'The answer')}</h2>
+    <img class="d-thumb" src="${r.answer.photo}" alt="">
+    <ol class="d-guesses">${rows.join('') || '<li class="nog" style="animation-delay:0s">Nobody guessed this round!</li>'}</ol>
+    <h3>Scoreboard</h3>
+    <ol class="d-scores" id="dScores"></ol>`;
+  renderScores(start + rows.length * 0.15 + 0.2);
+}
+
+function renderScores(delay) {
+  const el = $('#dScores');
+  if (!el) return;
+  el.style.animationDelay = `${delay}s`;
+  el.innerHTML = state.teams.map(t => `<li><span class="dot" style="--c:${t.color}"></span>${esc(t.name)}<span class="score">${t.score}</span></li>`).join('');
+}
+
+// ---------- final ----------
+function renderFinal() {
+  show('dFinal');
+  const [first, second] = state.teams;
+  $('#dWinner').textContent = first ? `${first.name} wins!` : 'Game over!';
+  $('#dWinnerSub').textContent = first && second && first.score === second.score
+    ? 'Tied on points, won on total distance across all rounds'
+    : '';
+  $('#dFinalList').innerHTML = state.teams.map((t, i) => `
+    <li style="animation-delay:${0.3 + (state.teams.length - 1 - i) * 0.5}s">
+      <span class="rank">${GG.medal(i)}</span>
+      <span class="dot" style="--c:${t.color}"></span>
+      <span class="name">${esc(t.name)}</span>
+      <span class="pts">${t.score} pt${t.score === 1 ? '' : 's'}</span>
+    </li>`).join('');
+  if (!confettiDone) {
+    confettiDone = true;
+    confetti();
+  }
+}
+
+function confetti() {
+  const box = $('#confetti');
+  box.innerHTML = '';
+  const colors = ['#facc15', '#a78bfa', '#22c55e', '#ef4444', '#3b82f6', '#ec4899'];
+  for (let i = 0; i < 140; i++) {
+    const p = document.createElement('i');
+    p.style.left = `${Math.random() * 100}%`;
+    p.style.background = colors[i % colors.length];
+    p.style.animationDelay = `${Math.random() * 4}s`;
+    p.style.animationDuration = `${3 + Math.random() * 3}s`;
+    box.appendChild(p);
+  }
+}
+
+// ---------- host controls ----------
+function hostAction() {
+  switch (state.phase) {
+    case 'lobby': return state.roundsCount ? { label: '▶ Start game', event: 'admin:start' } : null;
+    case 'round': return { label: '⏭ End round now', event: 'admin:endRound', noKey: true };
+    case 'results':
+      return state.roundNumber < state.totalRounds
+        ? { label: `▶ Next round (${state.roundNumber + 1}/${state.totalRounds})`, event: 'admin:next' }
+        : { label: '🏆 Final standings', event: 'admin:next' };
+    default: return null;
+  }
+}
+
+function updateHostBar() {
+  $('#hostBar').hidden = !isHost;
+  if (!isHost) return;
+  const a = hostAction();
+  $('#hostPrimary').hidden = !a;
+  if (a) $('#hostPrimary').textContent = a.label;
+  $('#hostTime').hidden = state.phase !== 'round';
+  $('#hostHint').textContent = a && !a.noKey ? 'or press Space' : state.phase === 'lobby' ? 'Add rounds on the admin page first' : '';
+}
+
+function runHost(event) {
+  socket.emit(event, {}, res => {
+    if (!res?.ok) $('#hostHint').textContent = res?.error || 'Something went wrong';
+  });
+}
+
+$('#hostPrimary').addEventListener('click', () => { const a = hostAction(); if (a) runHost(a.event); });
+$('#hostTime').addEventListener('click', () => runHost('admin:addTime'));
+
+document.addEventListener('keydown', e => {
+  if (!isHost || !state || e.repeat) return;
+  if (e.code === 'Space' || e.code === 'ArrowRight' || e.code === 'Enter') {
+    const a = hostAction();
+    if (a && !a.noKey) {
+      e.preventDefault();
+      runHost(a.event);
+    }
+  }
+  if (e.key === 'f') toggleFullscreen();
+});
+
+// ---------- fullscreen ----------
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+}
+$('#fsBtn').addEventListener('click', toggleFullscreen);
+</script>
+</body>
+</html>
