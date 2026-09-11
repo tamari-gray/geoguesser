@@ -385,19 +385,30 @@ body.player {
 .drop-zone:hover, .drop-zone.over { border-color: var(--accent); background: rgba(124, 92, 255, .08); }
 .drop-zone img { max-height: 200px; max-width: 100%; border-radius: 8px; }
 .template-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.template-bar select {
-  flex: 1 1 200px;
-  min-width: 0;
-  font: inherit;
-  font-weight: 700;
-  color: var(--text);
-  background: var(--bg-2);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: .5em .7em;
-}
-.template-bar select:disabled { opacity: .6; }
 .template-hint { margin: 8px 0 16px; }
+#editingName { color: #c4b5fd; }
+.template-list { list-style: none; margin: 12px 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.tpl {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-2);
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.tpl:hover { border-color: var(--accent-2); }
+.tpl.active { border-color: var(--accent); background: rgba(124, 92, 255, .14); cursor: default; }
+.template-list.locked .tpl:not(.active) { cursor: not-allowed; opacity: .6; }
+.tpl-cover { width: 64px; height: 46px; border-radius: 8px; object-fit: cover; flex: none; background: #000; }
+.tpl-cover.empty { display: grid; place-items: center; background: var(--card-2); font-size: 1.2rem; }
+.tpl-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.tpl-info b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tpl-badge { font-weight: 800; font-size: .85rem; color: #c4b5fd; padding: 0 6px; white-space: nowrap; }
+.new-game { display: flex; gap: 8px; flex-wrap: wrap; }
+.new-game input { flex: 1 1 200px; }
 .warn-box {
   margin-bottom: 16px;
   padding: 12px 14px;

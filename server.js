@@ -67,7 +67,9 @@ const settings = {
 
 const activeTemplate = () => templates.get(settings.activeTemplateId);
 const sortedTemplates = () => [...templates.values()].sort((a, b) => a.createdAt - b.createdAt);
-const templateSummary = t => ({ id: t.id, name: t.name, roundCount: t.rounds.length, updatedAt: t.updatedAt });
+const templateSummary = t => ({
+  id: t.id, name: t.name, roundCount: t.rounds.length, coverPhotoId: t.rounds[0]?.photoId || null, updatedAt: t.updatedAt,
+});
 const saveSettings = () => store.saveSettings(settings);
 
 async function saveTemplate(t) {

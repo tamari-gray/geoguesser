@@ -111,7 +111,7 @@ window.GG = (() => {
     return t + 300;
   }
 
-  // public tunnel link if running via `npm run share`, else a LAN address phones can reach
+  // PUBLIC_URL if the server sets one, else this site's own address (or a LAN address when opened via localhost)
   async function joinUrl() {
     try {
       const info = await (await fetch('/api/info')).json();
