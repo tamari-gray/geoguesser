@@ -1,0 +1,10 @@
+{
+  "timerSeconds": 30,
+  "showPhotoOnDevices": true,
+  "mapStart": {
+    "lat": 20,
+    "lng": 0,
+    "zoom": 2
+  },
+  "cartoKey": "cb1_3gix_1_e78f7660cb772860d3f2c499"
+}
