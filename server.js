@@ -75,8 +75,8 @@ async function saveTemplate(t) {
   await store.saveTemplate(t);
 }
 
-async function createTemplate(name, rounds = []) {
-  const t = { id: newId(), name, rounds, createdAt: Date.now(), updatedAt: Date.now() };
+async function createTemplate(name, rounds = [], id = newId()) {
+  const t = { id, name, rounds, createdAt: Date.now(), updatedAt: Date.now() };
   templates.set(t.id, t);
   await store.saveTemplate(t);
   return t;
@@ -85,11 +85,28 @@ async function createTemplate(name, rounds = []) {
 async function loadFromStore() {
   Object.assign(settings, readJson(BUNDLED_SETTINGS, {}), (await store.loadSettings()) || {});
   for (const t of await store.loadTemplates()) templates.set(t.id, t);
-  if (!templates.size) await createTemplate('My game');
+  // fixed id, so the laptop and the hosted site booting at once don't each create a default game
+  if (!templates.size) await createTemplate('My game', [], 'default');
   if (!templates.has(settings.activeTemplateId)) {
     settings.activeTemplateId = sortedTemplates()[0].id;
     await saveSettings();
   }
+
+  // Firebase only: pick up changes made by the other server (laptop <-> hosted site)
+  store.watch?.({
+    onTemplates(list) {
+      if (!list.length) return;
+      templates.clear();
+      for (const t of list) templates.set(t.id, t);
+      if (!templates.has(settings.activeTemplateId)) settings.activeTemplateId = sortedTemplates()[0].id;
+      broadcastState();
+    },
+    onSettings(saved) {
+      Object.assign(settings, saved);
+      if (!templates.has(settings.activeTemplateId)) settings.activeTemplateId = sortedTemplates()[0]?.id ?? null;
+      broadcastState();
+    },
+  });
 }
 
 // photoId -> Promise<{ buffer, contentType } | null>; photos never change, so caching is safe

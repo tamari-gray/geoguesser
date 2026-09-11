@@ -83,6 +83,12 @@ function firestoreStore(db, label) {
       return doc.exists ? doc.data() : null;
     },
     async saveSettings(s) { await settingsDoc.set(plain(s)); },
+    // live updates, so the laptop and the hosted site see each other's changes
+    watch({ onTemplates, onSettings }) {
+      const logError = what => err => console.error(`Firestore ${what} listener error:`, err.message);
+      db.collection('templates').onSnapshot(snap => onTemplates(snap.docs.map(d => d.data())), logError('templates'));
+      settingsDoc.onSnapshot(doc => { if (doc.exists) onSettings(doc.data()); }, logError('settings'));
+    },
     async savePhoto(id, buffer, contentType) {
       const count = Math.ceil(buffer.length / CHUNK_BYTES);
       for (let start = 0; start < count; start += CHUNKS_PER_BATCH) {
