@@ -43,6 +43,7 @@ The live admin page shows a warning banner as a reminder. Scores and teams are o
 ## Notes
 
 - **Internet:** map tiles load from the internet.
+- **Street map key:** CARTO's street map needs a free key from https://carto.com/basemaps/apikey. Paste it into admin → Settings → "Street map key" on your laptop, then run `npm run deploy`. Or set `CARTO_KEY` in the Render service's Environment tab. The satellite view needs no key.
 - **iPhone photos:** use JPG, not HEIC. HEIC doesn't display in most browsers.
 - Everything is saved in `data/` and `uploads/`. If the server restarts mid-game, scores are kept. To start fresh, delete `data/game.json`.
 - The same team name on a second phone joins the same team. Refreshing the page keeps you in the game.

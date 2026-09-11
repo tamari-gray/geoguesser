@@ -34,7 +34,9 @@ window.GG = (() => {
 
   function createMap(el, options = {}) {
     const map = L.map(el, { worldCopyJump: true, ...options });
-    const streets = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+    const cartoKey = window.GG_CONFIG?.cartoKey; // from /config.js; without it CARTO watermarks every tile
+    const keyParam = cartoKey ? `?key=${encodeURIComponent(cartoKey)}` : '';
+    const streets = L.tileLayer(`https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png${keyParam}`, {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
       subdomains: 'abcd',
       maxZoom: 20,

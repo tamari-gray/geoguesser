@@ -74,7 +74,7 @@ function lanUrls() {
 // ---------- persistent data ----------
 let rounds = readJson(ROUNDS_FILE, []); // [{ id, file, lat, lng, label }]
 const settings = Object.assign(
-  { timerSeconds: 30, showPhotoOnDevices: true, mapStart: { lat: 20, lng: 0, zoom: 2 } },
+  { timerSeconds: 30, showPhotoOnDevices: true, mapStart: { lat: 20, lng: 0, zoom: 2 }, cartoKey: '' },
   readJson(SETTINGS_FILE, {}),
 );
 const saveRounds = () => writeJson(ROUNDS_FILE, rounds);
@@ -282,6 +282,13 @@ const upload = multer({
 // PUBLIC_URL optionally overrides the join link shown on the presenter screen
 app.get('/api/info', (req, res) => res.json({ publicUrl: process.env.PUBLIC_URL || null, lanUrls: lanUrls() }));
 
+// Street-map tile key for the browser. CARTO keys are public by design (they sit in every tile URL);
+// restrict yours to your domains on dashboard.basemaps.carto.com. CARTO_KEY on the host overrides the admin setting.
+app.get('/config.js', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.type('application/javascript').send(`window.GG_CONFIG = ${JSON.stringify({ cartoKey: process.env.CARTO_KEY || settings.cartoKey || '' })};`);
+});
+
 app.get('/api/qr', async (req, res) => {
   const text = String(req.query.text || '').slice(0, 500);
   if (!text) return res.status(400).end();
@@ -353,6 +360,11 @@ app.put('/api/settings', requireAdmin, (req, res) => {
     settings.timerSeconds = n;
   }
   if (b.showPhotoOnDevices !== undefined) settings.showPhotoOnDevices = !!b.showPhotoOnDevices;
+  if (b.cartoKey !== undefined) {
+    const key = String(b.cartoKey).trim();
+    if (key.length > 200 || /[^\w.\-]/.test(key)) return res.status(400).json({ error: 'That map key looks wrong. Paste just the key itself.' });
+    settings.cartoKey = key;
+  }
   if (b.mapStart !== undefined) {
     const lat = Number(b.mapStart?.lat), lng = wrapLng(Number(b.mapStart?.lng)), zoom = Math.round(Number(b.mapStart?.zoom));
     if (!validLatLng(lat, lng) || !(zoom >= 1 && zoom <= 20)) return res.status(400).json({ error: 'Invalid map view.' });

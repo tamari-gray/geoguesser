@@ -56,6 +56,12 @@
             <button type="button" class="btn btn-ghost btn-sm" id="worldViewBtn">Whole world</button>
           </div>
         </div>
+        <label>Street map key (CARTO)
+          <input type="text" id="cartoKeyInput" placeholder="Paste your free CARTO basemaps key" spellcheck="false" autocomplete="off">
+          <span class="muted small">Without it the street map says "API KEY REQUIRED". Get one free at
+            <a href="https://carto.com/basemaps/apikey" target="_blank" rel="noopener">carto.com/basemaps/apikey</a>.
+            The satellite view doesn't need a key.</span>
+        </label>
       </div>
     </section>
   </div>
@@ -102,6 +108,7 @@
 <script src="/socket.io/socket.io.js"></script>
 <script src="/vendor/leaflet/leaflet.js"></script>
 <script src="/vendor/exifr/full.umd.js"></script>
+<script src="/config.js"></script>
 <script src="/common.js"></script>
 <script>
 const $ = sel => document.querySelector(sel);
@@ -508,14 +515,17 @@ list.addEventListener('dragend', () => {
 function renderSettings() {
   $('#timerInput').value = settings.timerSeconds;
   $('#photoToggle').checked = settings.showPhotoOnDevices;
+  $('#cartoKeyInput').value = settings.cartoKey || '';
   const m = settings.mapStart;
   $('#mapStartText').textContent = m.zoom <= 2 ? 'whole world' : `${m.lat.toFixed(3)}, ${m.lng.toFixed(3)} (zoom ${m.zoom})`;
 }
 
 let savedTimer;
 async function saveSettings(patch) {
+  let ok = false;
   try {
     settings = await api('/api/settings', { method: 'PUT', body: patch });
+    ok = true;
     $('#settingsSaved').hidden = false;
     clearTimeout(savedTimer);
     savedTimer = setTimeout(() => { $('#settingsSaved').hidden = true; }, 1500);
@@ -523,10 +533,14 @@ async function saveSettings(patch) {
     alert(err.message);
   }
   renderSettings();
+  return ok;
 }
 
 $('#timerInput').addEventListener('change', e => saveSettings({ timerSeconds: Number(e.target.value) }));
 $('#photoToggle').addEventListener('change', e => saveSettings({ showPhotoOnDevices: e.target.checked }));
+$('#cartoKeyInput').addEventListener('change', async e => {
+  if (await saveSettings({ cartoKey: e.target.value })) location.reload(); // maps read the key on page load
+});
 $('#useViewBtn').addEventListener('click', () => {
   const c = pickMap.getCenter().wrap();
   saveSettings({ mapStart: { lat: c.lat, lng: c.lng, zoom: pickMap.getZoom() } });
