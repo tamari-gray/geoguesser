@@ -552,11 +552,8 @@ $('#worldViewBtn').addEventListener('click', () => saveSettings({ mapStart: { la
   [settings, rounds] = await Promise.all([api('/api/settings'), api('/api/rounds')]);
   renderSettings();
   renderRounds();
-  if (rounds.length) {
-    pickMap.fitBounds(L.latLngBounds(rounds.map(r => [r.lat, r.lng])), { padding: [40, 40], maxZoom: 16 });
-  } else {
-    pickMap.setView([settings.mapStart.lat, settings.mapStart.lng], settings.mapStart.zoom);
-  }
+  // open on the same starting view the teams get (set in Settings)
+  pickMap.setView([settings.mapStart.lat, settings.mapStart.lng], settings.mapStart.zoom);
 })();
 </script>
 </body>
