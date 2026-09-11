@@ -29,14 +29,22 @@ During a round the monitor shows the photo and a countdown. Teams drop a pin and
 
 ## Hosted on Render (free)
 
-The live site runs on Render's free plan from the GitHub repo, so phones can join on mobile data or any Wi-Fi.
+The live site runs on Render's free plan from the GitHub repo, so phones can join on mobile data or any Wi-Fi. Code changes go live with `npm run deploy`, which commits and pushes. Render redeploys in about 2 minutes.
 
-**Render's free disk is wiped whenever the server restarts or sleeps.** So set up rounds on your laptop, not on the live site:
+## Game templates + Firebase
 
-1. `npm start`, open `http://localhost:3000`, log in as admin and add, edit or reorder rounds.
-2. `npm run deploy` commits the photos and rounds and pushes them. Render redeploys automatically in about 2 minutes.
+The admin page has a **Game** dropdown with New, Duplicate, Rename and Delete. Each game is its own ordered set of photo rounds, and the selected game is the one that plays when you press Start.
 
-The live admin page shows a warning banner as a reminder. Scores and teams are only kept in memory during the game, which is fine for one evening.
+Games, settings and photos are stored in **Firebase Firestore** when a Firebase key is present. That works on the free Spark plan, and photos are split into chunks under Firestore's 1 MB limit. Without a key, everything is stored in local files instead. Render's free plan wipes those whenever it restarts, so connect Firebase before adding rounds on the live site.
+
+Setup:
+
+1. https://console.firebase.google.com: open your project (or add one).
+2. **Build > Firestore Database > Create database**. Choose production mode and a location near you, e.g. `australia-southeast1`. The locked-down production rules are fine, because only the server talks to Firebase.
+3. **Project settings (⚙) > Service accounts > Generate new private key**. Save the file as `firebase-service-account.json` in this folder. It's gitignored; never commit it.
+4. On Render, open the service, go to **Environment > Secret Files > Add**. Name it `firebase-service-account.json`, paste the file's contents and save. The site restarts using Firebase.
+
+The server log and the admin page ("Saved in Firebase ✓") show which storage is in use. Scores and teams are only kept in memory during a game, which is fine for one evening.
 
 **Free instances sleep after 15 minutes with no visitors.** Open the site about a minute before the quiz so it's awake. While people are playing it stays up.
 

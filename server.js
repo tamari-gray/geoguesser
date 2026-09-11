@@ -8,51 +8,31 @@ const express = require('express');
 const multer = require('multer');
 const QRCode = require('qrcode');
 const { Server } = require('socket.io');
+const { createStore, readJson, writeJson } = require('./store');
 
 const PORT = Number(process.env.PORT) || 3000;
 const ADMIN_NAME = (process.env.ADMIN_NAME || 'kawaiifreak97').trim().toLowerCase();
-// STORAGE_DIR lets a cloud host point data + photos at a persistent volume
+// STORAGE_DIR moves the local data + photo folders (only used when Firebase isn't configured)
 const STORAGE_DIR = path.resolve(process.env.STORAGE_DIR || __dirname);
-// Render's free tier wipes the disk on every restart, so uploads made on the live site don't last
-const EPHEMERAL_STORAGE = !!process.env.RENDER && !process.env.STORAGE_DIR;
 const DATA_DIR = path.join(STORAGE_DIR, 'data');
 const UPLOAD_DIR = path.join(STORAGE_DIR, 'uploads');
-const ROUNDS_FILE = path.join(DATA_DIR, 'rounds.json');
-const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const GAME_FILE = path.join(DATA_DIR, 'game.json');
+const BUNDLED_SETTINGS = path.join(__dirname, 'data', 'settings.json');
 const TEAM_COLORS = ['#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#ec4899', '#14b8a6', '#f97316', '#84cc16', '#6366f1', '#06b6d4', '#e11d48'];
 const MISSING_GUESS_PENALTY = 20_000_000; // metres; only used as a leaderboard tie-breaker
 const ROUND_GRACE_MS = 750; // lets last-second submissions arrive
+const IMAGE_EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
+const PHOTO_ID = /^[a-f0-9]{20}\.(jpg|png|webp|gif)$/;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-// First boot on an empty volume: seed it with the rounds bundled in the repo (set up locally, then deployed)
-const BUNDLED_ROUNDS = path.join(__dirname, 'data', 'rounds.json');
-if (STORAGE_DIR !== __dirname && !fs.existsSync(ROUNDS_FILE) && fs.existsSync(BUNDLED_ROUNDS)) {
-  for (const file of ['rounds.json', 'settings.json']) {
-    const src = path.join(__dirname, 'data', file);
-    if (fs.existsSync(src)) fs.copyFileSync(src, path.join(DATA_DIR, file));
-  }
-  for (const file of fs.readdirSync(path.join(__dirname, 'uploads'))) {
-    fs.copyFileSync(path.join(__dirname, 'uploads', file), path.join(UPLOAD_DIR, file));
-  }
-  console.log(`Seeded ${STORAGE_DIR} with the bundled rounds.`);
-}
-
-function readJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
-}
-function writeJson(file, data) {
-  fs.writeFileSync(file + '.tmp', JSON.stringify(data, null, 2));
-  fs.renameSync(file + '.tmp', file);
-}
 
 const isAdmin = name => String(name || '').trim().toLowerCase() === ADMIN_NAME;
 const validLatLng = (lat, lng) => Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
 const wrapLng = lng => ((((lng + 180) % 360) + 360) % 360) - 180;
 const newId = () => crypto.randomBytes(6).toString('hex');
-const photoUrl = round => '/uploads/' + round.file;
+const photoUrl = round => `/photos/${round.photoId}`;
+const cleanName = name => String(name ?? '').trim().replace(/\s+/g, ' ').slice(0, 60);
 const reply = (ack, value) => { if (typeof ack === 'function') ack(value); };
 
 function haversine(lat1, lng1, lat2, lng2) {
@@ -71,21 +51,81 @@ function lanUrls() {
   return addrs.sort((a, b) => rank(a) - rank(b)).map(ip => `http://${ip}:${PORT}`);
 }
 
-// ---------- persistent data ----------
-let rounds = readJson(ROUNDS_FILE, []); // [{ id, file, lat, lng, label }]
-const settings = Object.assign(
-  { timerSeconds: 30, showPhotoOnDevices: true, mapStart: { lat: 20, lng: 0, zoom: 2 }, cartoKey: '' },
-  readJson(SETTINGS_FILE, {}),
-);
-const saveRounds = () => writeJson(ROUNDS_FILE, rounds);
-const saveSettings = () => writeJson(SETTINGS_FILE, settings);
+// ---------- templates, settings + photos (kept in memory, written through to the store) ----------
+const store = createStore({ rootDir: __dirname, dataDir: DATA_DIR, uploadDir: UPLOAD_DIR });
+// Render's free tier wipes local files whenever it restarts; Firebase doesn't
+const EPHEMERAL_STORAGE = store.kind === 'local' && !!process.env.RENDER && !process.env.STORAGE_DIR;
 
+const templates = new Map(); // id -> { id, name, rounds: [{ id, photoId, lat, lng, label }], createdAt, updatedAt }
+const settings = {
+  timerSeconds: 30,
+  showPhotoOnDevices: true,
+  mapStart: { lat: 20, lng: 0, zoom: 2 },
+  cartoKey: '',
+  activeTemplateId: null,
+};
+
+const activeTemplate = () => templates.get(settings.activeTemplateId);
+const sortedTemplates = () => [...templates.values()].sort((a, b) => a.createdAt - b.createdAt);
+const templateSummary = t => ({ id: t.id, name: t.name, roundCount: t.rounds.length, updatedAt: t.updatedAt });
+const saveSettings = () => store.saveSettings(settings);
+
+async function saveTemplate(t) {
+  t.updatedAt = Date.now();
+  await store.saveTemplate(t);
+}
+
+async function createTemplate(name, rounds = []) {
+  const t = { id: newId(), name, rounds, createdAt: Date.now(), updatedAt: Date.now() };
+  templates.set(t.id, t);
+  await store.saveTemplate(t);
+  return t;
+}
+
+async function loadFromStore() {
+  Object.assign(settings, readJson(BUNDLED_SETTINGS, {}), (await store.loadSettings()) || {});
+  for (const t of await store.loadTemplates()) templates.set(t.id, t);
+  if (!templates.size) await createTemplate('My game');
+  if (!templates.has(settings.activeTemplateId)) {
+    settings.activeTemplateId = sortedTemplates()[0].id;
+    await saveSettings();
+  }
+}
+
+// photoId -> Promise<{ buffer, contentType } | null>; photos never change, so caching is safe
+const photoCache = new Map();
+function getPhoto(id) {
+  if (!photoCache.has(id)) {
+    const pending = store.loadPhoto(id).then(
+      photo => { if (!photo) photoCache.delete(id); return photo; },
+      err => { photoCache.delete(id); throw err; },
+    );
+    photoCache.set(id, pending);
+    if (photoCache.size > 60) photoCache.delete(photoCache.keys().next().value);
+  }
+  return photoCache.get(id);
+}
+
+// deletes photos that no template (and not the game in progress) uses any more
+async function deleteUnusedPhotos(photoIds) {
+  const used = new Set([...templates.values()].flatMap(t => t.rounds.map(r => r.photoId)));
+  for (const r of game.rounds) used.add(r.photoId);
+  for (const id of photoIds) {
+    if (used.has(id)) continue;
+    photoCache.delete(id);
+    await store.deletePhoto(id).catch(err => console.error(`Could not delete photo ${id}:`, err.message));
+  }
+}
+
+// ---------- game state (local file; only needs to survive a quick restart) ----------
 function freshGame(teams = {}) {
-  return { phase: 'lobby', roundIds: [], roundIndex: -1, endsAt: null, guesses: {}, results: [], teams };
+  return { phase: 'lobby', rounds: [], roundIndex: -1, endsAt: null, guesses: {}, results: [], teams };
 }
 let game = readJson(GAME_FILE, null) || freshGame();
+if (!Array.isArray(game.rounds)) game = freshGame(game.teams || {}); // game file from an older version
 const saveGame = () => writeJson(GAME_FILE, game);
-const currentRound = () => rounds.find(r => r.id === game.roundIds[game.roundIndex]);
+const currentRound = () => game.rounds[game.roundIndex];
+const gameRunning = () => game.phase === 'round' || game.phase === 'results';
 
 // live socket connections per team (not persisted)
 const connections = new Map(); // teamKey -> Set<socketId>
@@ -116,13 +156,12 @@ function teamSummaries() {
 }
 
 function buildState(role, teamKey) {
-  const inRound = game.phase === 'round' || game.phase === 'results';
-  const round = inRound ? currentRound() : null;
+  const round = gameRunning() ? currentRound() : null;
   const state = {
     now: Date.now(),
     phase: game.phase,
     roundNumber: game.roundIndex + 1,
-    totalRounds: game.phase === 'lobby' ? rounds.length : game.roundIds.length,
+    totalRounds: game.phase === 'lobby' ? activeTemplate()?.rounds.length || 0 : game.rounds.length,
     endsAt: game.endsAt,
     timerSeconds: settings.timerSeconds,
     mapStart: settings.mapStart,
@@ -137,7 +176,10 @@ function buildState(role, teamKey) {
     state.myGuess = game.guesses[teamKey] || null;
   }
   if (role === 'admin') {
-    state.roundsCount = rounds.length;
+    state.roundsCount = activeTemplate()?.rounds.length || 0;
+    state.activeTemplateId = settings.activeTemplateId;
+    state.activeTemplateName = activeTemplate()?.name || '';
+    state.storage = store.kind;
     state.ephemeralStorage = EPHEMERAL_STORAGE;
     state.answer = round ? { lat: round.lat, lng: round.lng, label: round.label } : null;
   }
@@ -147,6 +189,7 @@ function buildState(role, teamKey) {
 let io;
 const sendState = socket => socket.emit('state', buildState(socket.data.role, socket.data.teamKey));
 function broadcastState() {
+  if (!io) return;
   for (const socket of io.sockets.sockets.values()) if (socket.data.role) sendState(socket);
 }
 
@@ -155,11 +198,14 @@ let roundTimer = null;
 let allInTimer = null;
 
 function startGame() {
-  if (!rounds.length) throw new Error('Add at least one round before starting.');
-  if (game.phase === 'round' || game.phase === 'results') throw new Error('A game is already running. Reset it first.');
+  const tpl = activeTemplate();
+  if (!tpl?.rounds.length) throw new Error('Add at least one round to the selected game first.');
+  if (gameRunning()) throw new Error('A game is already running. Go back to the lobby first.');
   for (const t of Object.values(game.teams)) t.score = 0;
-  game.roundIds = rounds.map(r => r.id);
+  // snapshot the rounds so editing the template mid-game can't break the game
+  game.rounds = tpl.rounds.map(r => ({ ...r }));
   game.results = [];
+  for (const r of game.rounds) getPhoto(r.photoId).catch(() => {}); // warm the cache
   startRound(0);
 }
 
@@ -210,7 +256,7 @@ function endRound() {
 
 function nextRound() {
   if (game.phase !== 'results') throw new Error('Nothing to advance to right now.');
-  if (game.roundIndex + 1 < game.roundIds.length) return startRound(game.roundIndex + 1);
+  if (game.roundIndex + 1 < game.rounds.length) return startRound(game.roundIndex + 1);
   game.phase = 'final';
   saveGame();
   broadcastState();
@@ -261,7 +307,6 @@ function resetGame(keepTeams) {
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '1h' }));
 app.use('/vendor/leaflet', express.static(path.join(__dirname, 'node_modules/leaflet/dist')));
 app.use('/vendor/exifr', express.static(path.join(__dirname, 'node_modules/exifr/dist')));
 
@@ -270,13 +315,29 @@ function requireAdmin(req, res, next) {
   res.status(403).json({ error: 'Admin only.' });
 }
 
+function findTemplate(req, res) {
+  const t = templates.get(req.params.id);
+  if (!t) res.status(404).json({ error: 'Game not found. Reload the page.' });
+  return t;
+}
+
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: UPLOAD_DIR,
-    filename: (req, file, cb) => cb(null, crypto.randomBytes(10).toString('hex') + (path.extname(file.originalname).toLowerCase() || '.jpg')),
-  }),
-  limits: { fileSize: 40 * 1024 * 1024 },
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
   fileFilter: (req, file, cb) => cb(null, file.mimetype.startsWith('image/')),
+});
+
+app.get('/photos/:id', async (req, res) => {
+  if (!PHOTO_ID.test(req.params.id)) return res.status(404).end();
+  try {
+    const photo = await getPhoto(req.params.id);
+    if (!photo) return res.status(404).end();
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    res.type(photo.contentType).send(photo.buffer);
+  } catch (err) {
+    console.error(`Photo ${req.params.id} failed to load:`, err.message);
+    res.status(502).end();
+  }
 });
 
 // PUBLIC_URL optionally overrides the join link shown on the presenter screen
@@ -295,35 +356,103 @@ app.get('/api/qr', async (req, res) => {
   res.type('image/svg+xml').send(await QRCode.toString(text, { type: 'svg', margin: 1 }));
 });
 
-app.get('/api/rounds', requireAdmin, (req, res) => res.json(rounds));
+// ----- game templates -----
+app.get('/api/templates', requireAdmin, (req, res) => {
+  res.json({ activeTemplateId: settings.activeTemplateId, templates: sortedTemplates().map(templateSummary) });
+});
 
-app.post('/api/rounds', requireAdmin, upload.single('photo'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'Please choose an image file.' });
-  const lat = Number(req.body.lat), lng = Number(req.body.lng);
-  if (!validLatLng(lat, lng)) {
-    fs.unlink(req.file.path, () => {});
-    return res.status(400).json({ error: 'Please set a valid latitude and longitude.' });
+app.post('/api/templates', requireAdmin, async (req, res) => {
+  const name = cleanName(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'Give the game a name.' });
+  const source = req.body?.copyFrom ? templates.get(req.body.copyFrom) : null;
+  // a duplicate shares the original's photos; a photo is only deleted once nothing uses it
+  const t = await createTemplate(name, source ? source.rounds.map(r => ({ ...r, id: newId() })) : []);
+  res.json(templateSummary(t));
+});
+
+app.get('/api/templates/:id', requireAdmin, (req, res) => {
+  const t = findTemplate(req, res);
+  if (t) res.json(t);
+});
+
+app.put('/api/templates/:id', requireAdmin, async (req, res) => {
+  const t = findTemplate(req, res);
+  if (!t) return;
+  const name = cleanName(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'Give the game a name.' });
+  t.name = name;
+  await saveTemplate(t);
+  broadcastState();
+  res.json(templateSummary(t));
+});
+
+app.delete('/api/templates/:id', requireAdmin, async (req, res) => {
+  const t = findTemplate(req, res);
+  if (!t) return;
+  if (templates.size === 1) return res.status(409).json({ error: "You can't delete your only game. Create another one first." });
+  if (t.id === settings.activeTemplateId && gameRunning()) {
+    return res.status(409).json({ error: 'This game is being played right now. Go back to the lobby first.' });
   }
-  const round = { id: newId(), file: req.file.filename, lat, lng, label: String(req.body.label || '').trim().slice(0, 100) };
-  rounds.push(round);
-  saveRounds();
+  templates.delete(t.id);
+  await store.deleteTemplate(t.id);
+  if (settings.activeTemplateId === t.id) {
+    settings.activeTemplateId = sortedTemplates()[0].id;
+    await saveSettings();
+  }
+  await deleteUnusedPhotos(t.rounds.map(r => r.photoId));
+  broadcastState();
+  res.json({ ok: true, activeTemplateId: settings.activeTemplateId });
+});
+
+app.put('/api/templates/:id/activate', requireAdmin, async (req, res) => {
+  const t = findTemplate(req, res);
+  if (!t) return;
+  if (gameRunning() && t.id !== settings.activeTemplateId) {
+    return res.status(409).json({ error: 'Finish the current game (or go back to the lobby) before switching games.' });
+  }
+  settings.activeTemplateId = t.id;
+  await saveSettings();
+  broadcastState();
+  res.json({ ok: true });
+});
+
+// ----- rounds within a template -----
+app.post('/api/templates/:id/rounds', requireAdmin, upload.single('photo'), async (req, res) => {
+  const t = findTemplate(req, res);
+  if (!t) return;
+  if (!req.file) return res.status(400).json({ error: 'Please choose an image file.' });
+  const ext = IMAGE_EXT[req.file.mimetype];
+  if (!ext) return res.status(400).json({ error: 'Please use a JPG, PNG or WebP photo.' });
+  const lat = Number(req.body.lat), lng = Number(req.body.lng);
+  if (!validLatLng(lat, lng)) return res.status(400).json({ error: 'Please set a valid latitude and longitude.' });
+
+  const photoId = `${crypto.randomBytes(10).toString('hex')}.${ext}`;
+  await store.savePhoto(photoId, req.file.buffer, req.file.mimetype);
+  photoCache.set(photoId, Promise.resolve({ buffer: req.file.buffer, contentType: req.file.mimetype }));
+  const round = { id: newId(), photoId, lat, lng, label: String(req.body.label || '').trim().slice(0, 100) };
+  t.rounds.push(round);
+  await saveTemplate(t);
   broadcastState();
   res.json(round);
 });
 
-app.put('/api/rounds/order', requireAdmin, (req, res) => {
+app.put('/api/templates/:id/rounds/order', requireAdmin, async (req, res) => {
+  const t = findTemplate(req, res);
+  if (!t) return;
   const ids = req.body?.ids;
   if (!Array.isArray(ids)) return res.status(400).json({ error: 'Expected a list of round ids.' });
-  const byId = new Map(rounds.map(r => [r.id, r]));
+  const byId = new Map(t.rounds.map(r => [r.id, r]));
   const ordered = [...new Set(ids)].map(id => byId.get(id)).filter(Boolean);
-  for (const r of rounds) if (!ordered.includes(r)) ordered.push(r);
-  rounds = ordered;
-  saveRounds();
-  res.json(rounds);
+  for (const r of t.rounds) if (!ordered.includes(r)) ordered.push(r);
+  t.rounds = ordered;
+  await saveTemplate(t);
+  res.json(t.rounds);
 });
 
-app.put('/api/rounds/:id', requireAdmin, (req, res) => {
-  const round = rounds.find(r => r.id === req.params.id);
+app.put('/api/templates/:id/rounds/:roundId', requireAdmin, async (req, res) => {
+  const t = findTemplate(req, res);
+  if (!t) return;
+  const round = t.rounds.find(r => r.id === req.params.roundId);
   if (!round) return res.status(404).json({ error: 'Round not found.' });
   const b = req.body || {};
   if (b.lat !== undefined || b.lng !== undefined) {
@@ -333,26 +462,26 @@ app.put('/api/rounds/:id', requireAdmin, (req, res) => {
     round.lng = lng;
   }
   if (b.label !== undefined) round.label = String(b.label).trim().slice(0, 100);
-  saveRounds();
+  await saveTemplate(t);
   res.json(round);
 });
 
-app.delete('/api/rounds/:id', requireAdmin, (req, res) => {
-  if (game.phase === 'round' || game.phase === 'results') {
-    return res.status(409).json({ error: "Can't delete rounds while a game is running. Go back to the lobby first." });
-  }
-  const index = rounds.findIndex(r => r.id === req.params.id);
+app.delete('/api/templates/:id/rounds/:roundId', requireAdmin, async (req, res) => {
+  const t = findTemplate(req, res);
+  if (!t) return;
+  const index = t.rounds.findIndex(r => r.id === req.params.roundId);
   if (index === -1) return res.status(404).json({ error: 'Round not found.' });
-  const [removed] = rounds.splice(index, 1);
-  fs.unlink(path.join(UPLOAD_DIR, removed.file), () => {});
-  saveRounds();
+  const [removed] = t.rounds.splice(index, 1);
+  await saveTemplate(t);
+  await deleteUnusedPhotos([removed.photoId]);
   broadcastState();
   res.json({ ok: true });
 });
 
+// ----- settings -----
 app.get('/api/settings', requireAdmin, (req, res) => res.json(settings));
 
-app.put('/api/settings', requireAdmin, (req, res) => {
+app.put('/api/settings', requireAdmin, async (req, res) => {
   const b = req.body || {};
   if (b.timerSeconds !== undefined) {
     const n = Math.round(Number(b.timerSeconds));
@@ -370,14 +499,14 @@ app.put('/api/settings', requireAdmin, (req, res) => {
     if (!validLatLng(lat, lng) || !(zoom >= 1 && zoom <= 20)) return res.status(400).json({ error: 'Invalid map view.' });
     settings.mapStart = { lat, lng, zoom };
   }
-  saveSettings();
+  await saveSettings();
   broadcastState();
   res.json(settings);
 });
 
 app.use((err, req, res, next) => {
   console.error(err.message);
-  res.status(err.status || 400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Photo is too large (max 40 MB).' : err.message });
+  res.status(err.status || 400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Photo is too large (max 15 MB).' : err.message });
 });
 
 // ---------- sockets ----------
@@ -477,18 +606,31 @@ io.on('connection', socket => {
   onAdmin('admin:removeTeam', p => removeTeam(String(p.key)));
 });
 
-// resume a game that was interrupted by a server restart
-if ((game.phase === 'round' || game.phase === 'results') && !currentRound()) game = freshGame(game.teams);
-if (game.phase === 'round') {
-  game.endsAt = Date.now() + settings.timerSeconds * 1000;
-  scheduleRoundEnd();
-}
+// ---------- start ----------
+(async () => {
+  try {
+    await loadFromStore();
+  } catch (err) {
+    console.error(`\n❌ Could not load games from ${store.label}:\n   ${err.message}`);
+    if (store.kind === 'firebase') {
+      console.error('   Check that Firestore is enabled: Firebase console > Build > Firestore Database > Create database.');
+    }
+    process.exit(1);
+  }
 
-server.listen(PORT, () => {
-  console.log('\n📍 GeoGuesser is running!\n');
-  console.log(`   This computer:    http://localhost:${PORT}`);
-  for (const url of lanUrls()) console.log(`   Same network:     ${url}`);
-  console.log(`   Presenter screen: http://localhost:${PORT}/display.html`);
-  console.log(`   Storage:          ${STORAGE_DIR}`);
-  console.log(`\n   Admin username:   ${ADMIN_NAME}\n`);
-});
+  // resume a game that was interrupted by a server restart
+  if (gameRunning() && !currentRound()) game = freshGame(game.teams);
+  if (game.phase === 'round') {
+    game.endsAt = Date.now() + settings.timerSeconds * 1000;
+    scheduleRoundEnd();
+  }
+
+  server.listen(PORT, () => {
+    console.log('\n📍 GeoGuesser is running!\n');
+    console.log(`   This computer:    http://localhost:${PORT}`);
+    for (const url of lanUrls()) console.log(`   Same network:     ${url}`);
+    console.log(`   Presenter screen: http://localhost:${PORT}/display.html`);
+    console.log(`   Games + photos:   ${store.label}`);
+    console.log(`\n   Admin username:   ${ADMIN_NAME}\n`);
+  });
+})();

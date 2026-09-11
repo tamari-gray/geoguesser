@@ -68,10 +68,18 @@
 
   <div class="admin-col">
     <section class="card">
-      <div class="card-head"><h2>Rounds</h2><span class="muted" id="roundCount"></span></div>
+      <div class="card-head"><h2>Games &amp; rounds</h2><span class="muted" id="roundCount"></span></div>
+      <div class="template-bar">
+        <select id="templateSelect" aria-label="Game"></select>
+        <button type="button" class="btn btn-secondary btn-sm" data-tpl="new">+ New</button>
+        <button type="button" class="btn btn-secondary btn-sm" data-tpl="copy">Duplicate</button>
+        <button type="button" class="btn btn-secondary btn-sm" data-tpl="rename">Rename</button>
+        <button type="button" class="btn btn-danger btn-sm" data-tpl="delete">Delete</button>
+      </div>
+      <p class="muted small template-hint">The selected game is the one that plays when you press Start. Each game keeps its own photos and order. <span id="storageInfo"></span></p>
       <div id="ephemeralWarn" class="warn-box" hidden>
-        ⚠️ <b>This live site can't keep new photos.</b> Rounds and settings changed here are wiped whenever the server restarts or sleeps.
-        Add rounds on your laptop instead (<code>npm start</code>, then this admin page), then run <code>npm run deploy</code>.
+        ⚠️ <b>This live site can't keep new photos.</b> Games and settings changed here are wiped whenever the server restarts or sleeps.
+        Connect Firebase so they're kept (see the README), or add rounds on your laptop and run <code>npm run deploy</code>.
       </div>
       <form id="addForm" class="add-grid" autocomplete="off">
         <div class="add-left">
@@ -161,10 +169,13 @@ function renderGame() {
   $('#phaseBadge').textContent = PHASES[s.phase];
   $('#phaseBadge').className = `phase-badge ${s.phase}`;
   $('#ephemeralWarn').hidden = !s.ephemeralStorage;
+  $('#storageInfo').textContent = s.storage === 'firebase' ? 'Saved in Firebase ✓' : 'Saved on this computer.';
+  $('#templateSelect').disabled = s.phase === 'round' || s.phase === 'results';
+  $('#templateSelect').title = $('#templateSelect').disabled ? 'Go back to the lobby to switch games' : '';
 
   let status = '';
   if (s.phase === 'lobby') {
-    status = `<b>${plural(s.roundsCount, 'round')}</b> ready · <b>${plural(s.teams.length, 'team')}</b> joined`;
+    status = `<b>${esc(s.activeTemplateName)}</b> · ${plural(s.roundsCount, 'round')} ready · <b>${plural(s.teams.length, 'team')}</b> joined`;
   } else if (s.phase === 'round') {
     const done = s.teams.filter(t => t.submitted).length;
     status = `Round <b>${s.roundNumber}</b> of ${s.totalRounds} · <b id="adminTimer"></b> left · <b>${done}/${s.teams.length}</b> locked in`;
@@ -244,6 +255,8 @@ GG.joinUrl().then(url => {
 // ================= Rounds =================
 let rounds = [];
 let settings = null;
+let templates = [], activeTemplateId = null;
+const roundsApi = (suffix = '') => `/api/templates/${activeTemplateId}/rounds${suffix}`;
 let pickedFile = null, previewUrl = null, pickMarker = null;
 
 const pickMap = GG.createMap('pickMap');
@@ -377,7 +390,7 @@ $('#addForm').addEventListener('submit', async e => {
     fd.append('lat', coords.lat);
     fd.append('lng', coords.lng);
     fd.append('label', $('#labelInput').value.trim());
-    await api('/api/rounds', { method: 'POST', body: fd });
+    await api(roundsApi(), { method: 'POST', body: fd });
     resetAddForm();
     await loadRounds();
   } catch (err) {
@@ -389,19 +402,68 @@ $('#addForm').addEventListener('submit', async e => {
 });
 
 // ----- round list -----
+// ----- game templates -----
+async function loadTemplates() {
+  ({ templates, activeTemplateId } = await api('/api/templates'));
+  $('#templateSelect').innerHTML = templates
+    .map(t => `<option value="${t.id}" ${t.id === activeTemplateId ? 'selected' : ''}>${esc(t.name)} (${plural(t.roundCount, 'round')})</option>`)
+    .join('');
+  $('[data-tpl="delete"]').disabled = templates.length < 2;
+  await loadRounds();
+}
+
 async function loadRounds() {
-  rounds = await api('/api/rounds');
+  rounds = (await api(`/api/templates/${activeTemplateId}`)).rounds;
   renderRounds();
 }
 
+$('#templateSelect').addEventListener('change', async e => {
+  try {
+    await api(`/api/templates/${e.target.value}/activate`, { method: 'PUT' });
+  } catch (err) {
+    alert(err.message);
+  }
+  await loadTemplates();
+});
+
+$('.template-bar').addEventListener('click', async e => {
+  const act = e.target.closest('[data-tpl]')?.dataset.tpl;
+  if (!act) return;
+  const current = templates.find(t => t.id === activeTemplateId);
+  try {
+    if (act === 'new' || act === 'copy') {
+      const name = prompt(act === 'new' ? 'Name for the new game:' : 'Name for the copy:', act === 'new' ? '' : `${current.name} (copy)`);
+      if (!name?.trim()) return;
+      const t = await api('/api/templates', { method: 'POST', body: { name, copyFrom: act === 'copy' ? current.id : undefined } });
+      await api(`/api/templates/${t.id}/activate`, { method: 'PUT' });
+    } else if (act === 'rename') {
+      const name = prompt('New name for this game:', current.name);
+      if (!name?.trim()) return;
+      await api(`/api/templates/${current.id}`, { method: 'PUT', body: { name } });
+    } else if (act === 'delete') {
+      if (!confirm(`Delete "${current.name}" and its ${plural(current.roundCount, 'round')}? Photos that no other game uses are deleted too.`)) return;
+      await api(`/api/templates/${current.id}`, { method: 'DELETE' });
+    }
+  } catch (err) {
+    alert(err.message);
+  }
+  await loadTemplates();
+});
+
 function renderRounds() {
   $('#roundCount').textContent = rounds.length ? plural(rounds.length, 'round') : '';
+  const current = templates.find(t => t.id === activeTemplateId);
+  const option = $('#templateSelect').selectedOptions[0];
+  if (current && option) {
+    current.roundCount = rounds.length;
+    option.textContent = `${current.name} (${plural(rounds.length, 'round')})`;
+  }
   $('#roundsEmpty').hidden = rounds.length > 0;
   $('#roundList').innerHTML = rounds.map((r, i) => `
     <li class="round-item" data-id="${r.id}">
       <span class="handle" title="Drag to reorder">⠿</span>
       <span class="round-num">${i + 1}</span>
-      <img src="/uploads/${esc(r.file)}" class="thumb" loading="lazy" alt="">
+      <img src="/photos/${esc(r.photoId)}" class="thumb" loading="lazy" alt="">
       <div class="round-fields">
         <input class="r-label" value="${esc(r.label)}" placeholder="Answer / description" maxlength="100">
         <input class="r-coords" value="${r.lat.toFixed(6)}, ${r.lng.toFixed(6)}" title="Latitude, longitude">
@@ -426,7 +488,7 @@ function renderRounds() {
 async function saveOrder(ids) {
   if (ids.join() === rounds.map(r => r.id).join()) return;
   try {
-    rounds = await api('/api/rounds/order', { method: 'PUT', body: { ids } });
+    rounds = await api(roundsApi('/order'), { method: 'PUT', body: { ids } });
   } catch (err) {
     alert(err.message);
   }
@@ -452,7 +514,7 @@ list.addEventListener('click', async e => {
   } else if (act === 'del') {
     if (!confirm(`Delete round ${i + 1}?`)) return;
     try {
-      await api(`/api/rounds/${id}`, { method: 'DELETE' });
+      await api(roundsApi(`/${id}`), { method: 'DELETE' });
       await loadRounds();
     } catch (err) {
       alert(err.message);
@@ -466,11 +528,11 @@ list.addEventListener('change', async e => {
   const id = li.dataset.id;
   try {
     if (e.target.classList.contains('r-label')) {
-      await api(`/api/rounds/${id}`, { method: 'PUT', body: { label: e.target.value } });
+      await api(roundsApi(`/${id}`), { method: 'PUT', body: { label: e.target.value } });
     } else if (e.target.classList.contains('r-coords')) {
       const c = GG.parseCoords(e.target.value);
       if (!c) throw new Error('Coordinates should look like "51.5074, -0.1278".');
-      await api(`/api/rounds/${id}`, { method: 'PUT', body: c });
+      await api(roundsApi(`/${id}`), { method: 'PUT', body: c });
     }
     await loadRounds();
     const saved = list.querySelector(`[data-id="${id}"]`);
@@ -549,9 +611,9 @@ $('#worldViewBtn').addEventListener('click', () => saveSettings({ mapStart: { la
 
 // ================= Init =================
 (async () => {
-  [settings, rounds] = await Promise.all([api('/api/settings'), api('/api/rounds')]);
+  settings = await api('/api/settings');
   renderSettings();
-  renderRounds();
+  await loadTemplates();
   // open on the same starting view the teams get (set in Settings)
   pickMap.setView([settings.mapStart.lat, settings.mapStart.lng], settings.mapStart.zoom);
 })();
